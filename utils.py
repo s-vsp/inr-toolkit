@@ -55,3 +55,13 @@ def infer_in_chunks(net: nn.Module, coords: torch.Tensor, device: torch.device, 
             out_list.append(out_chunk)
     out = torch.cat(out_list, dim=0).numpy()
     return out
+
+
+def move_optimizer_state_to_device(optimizer, device):
+    """
+    After loading optimizer.state_dict(), ensure tensors are on the correct device
+    """
+    for state in optimizer.state.values():
+        for k, v in list(state.items()):
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
