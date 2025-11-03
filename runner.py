@@ -178,9 +178,6 @@ def main(args):
             ckpt_name = f"{args.run_name}_epoch_{epoch}.pt"
             torch.save(checkpoint, ckpt_name)
             logging.info(f"Saved checkpoint: {ckpt_name}")
-            
-            if use_wandb:
-                wandb.save(ckpt_name)
 
         if epoch % args.save_img_every == 0:
             with torch.no_grad():
