@@ -4,5 +4,5 @@ model:
     dim_in:                     2
     dim_hidden:                 512
     dim_out:                    3
-    num_layers:                 8
+    num_layers:                 12
     w0_initial:                 30.

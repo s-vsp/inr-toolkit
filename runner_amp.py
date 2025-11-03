@@ -10,6 +10,7 @@ from torch import nn, optim
 from torch.utils.data import TensorDataset, DataLoader
 from PIL import Image
 from dotenv import load_dotenv
+from tqdm import tqdm
 
 from registry import MODEL_REGISTRY
 from utils import infer_in_chunks, image_to_coords_and_pixels, move_optimizer_state_to_device
@@ -75,29 +76,58 @@ def parse_args():
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--run_name", type=str, default="hello_world", help="Run name for WandB and checkpointing")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader num_workers")
+    parser.add_argument("--pin_memory", action="store_true", help="Use DataLoader pin_memory")
+    parser.add_argument("--amp", action="store_true", help="Use mixed precision (torch.cuda.amp)")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile() if available")
+    parser.add_argument("--accum_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--data_on_gpu", action="store_true", help="Load full dataset tensors onto GPU (fast but uses GPU memory)")
+    parser.add_argument("--log_every", type=int, default=50, help="Log every N batches (0 to disable)")
+    parser.add_argument("--ckpt_dir", type=str, default=".", help="Directory where checkpoints are saved")
     args = parser.parse_args()
     return args
 
 
+def _ensure_dir(path):
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
 def main(args):
     set_seed(args.seed)
+    _ensure_dir(args.ckpt_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Device: {device}")
 
     if not os.path.exists(args.image_path):
-        raise FileNotFoundError(f"Image '{args.image_path}' not found. Place a PNG at this path or change image_path.")
-    img = Image.open(args.image_path)
+        raise FileNotFoundError(f"Image '{args.image_path}' not found. Place a PNG/JPEG at this path or change image_path.")
+    img = Image.open(args.image_path).convert("RGB")
     coords, pixels, (H, W) = image_to_coords_and_pixels(img)
     N = coords.shape[0]
     logging.info(f"Coords/pixels shapes: {coords.shape}, {pixels.shape} (H={H}, W={W}, N={N})")
 
-    dataset = TensorDataset(coords, pixels)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True)
-    
+    if args.data_on_gpu and device.type == "cuda":
+        logging.info("Moving full dataset to GPU (data_on_gpu=True). This will use GPU memory.")
+        coords = coords.to(device)
+        pixels = pixels.to(device)
+        dataset = TensorDataset(coords, pixels)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    else:
+        dataset = TensorDataset(coords, pixels)
+        loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                            num_workers=args.num_workers, pin_memory=args.pin_memory)
+
     cfg = load_config(args.model_config)
     model = build_model_from_cfg(cfg)
     model = model.to(device)
+
+    if args.compile:
+        try:
+            model = torch.compile(model)  # may speed up
+            logging.info("Applied torch.compile() to the model.")
+        except Exception as e:
+            logging.warning(f"torch.compile() failed or not available: {e}")
 
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
@@ -108,18 +138,25 @@ def main(args):
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Checkpoint '{args.resume}' not found.")
         logging.info(f"Loading checkpoint from {args.resume}")
-        
         resumed_ckpt = torch.load(args.resume, map_location=device)
 
         if "model_state_dict" in resumed_ckpt:
-            model.load_state_dict(resumed_ckpt["model_state_dict"])
+            try:
+                model.load_state_dict(resumed_ckpt["model_state_dict"])
+                logging.info("Loaded model_state_dict from checkpoint.")
+            except Exception as e:
+                logging.warning(f"Failed to load model_state_dict cleanly: {e}")
         else:
             logging.warning("Checkpoint does not contain model_state_dict.")
 
         if "optimizer_state_dict" in resumed_ckpt:
             try:
                 optimizer.load_state_dict(resumed_ckpt["optimizer_state_dict"])
-                move_optimizer_state_to_device(optimizer, device)
+                try:
+                    move_optimizer_state_to_device(optimizer, device)
+                except Exception:
+                    move_optimizer_state_to_device(optimizer, device)
+                logging.info("Loaded optimizer_state_dict and moved to device.")
             except Exception as e:
                 logging.warning(f"Failed to fully load optimizer state: {e}")
 
@@ -191,56 +228,104 @@ def main(args):
             wandb_run = None
             use_wandb = False
 
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
+
+    total_steps_per_epoch = len(loader)
+    logging.info(f"Starting training from epoch {start_epoch} to {args.epochs}. Steps per epoch: {total_steps_per_epoch}")
+
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        running = 0.0
-        for bc, bt in loader:
-            optimizer.zero_grad()
+        running_loss_sum = 0.0
+        seen_samples = 0
 
-            bc = bc.to(device, non_blocking=True)
-            bt = bt.to(device, non_blocking=True)
+        iterator = enumerate(loader, start=1)
 
-            pred = model(bc)
-            loss = criterion(pred, bt)
+        pbar = tqdm(iterator, total=total_steps_per_epoch, desc=f"Epoch {epoch}", leave=False)
 
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        for bidx, (bc, bt) in pbar:
 
-            running += loss.item() * bc.shape[0]
+            if not args.data_on_gpu:
+                bc = bc.to(device, non_blocking=True)
+                bt = bt.to(device, non_blocking=True)
 
-        epoch_loss = running / N
+            with torch.cuda.amp.autocast(enabled=(args.amp and device.type == "cuda")):
+                pred = model(bc)
+                loss = criterion(pred, bt)
+
+            loss_unscaled = loss.detach()
+            loss_to_backward = loss / args.accum_steps
+
+            # backward
+            if args.amp and device.type == "cuda":
+                scaler.scale(loss_to_backward).backward()
+            else:
+                loss_to_backward.backward()
+
+            if (bidx % args.accum_steps) == 0:
+                if args.amp and device.type == "cuda":
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
+
+            batch_n = bc.shape[0]
+            running_loss_sum += float(loss_unscaled.item()) * batch_n
+            seen_samples += batch_n
+
+            avg_loss = running_loss_sum / seen_samples if seen_samples > 0 else float("nan")
+            pbar.set_postfix_str(f"loss={avg_loss:.6f}")
+
+            if args.log_every and (bidx % args.log_every == 0):
+                logging.info(f"Epoch {epoch} batch {bidx}/{total_steps_per_epoch} avg_loss {avg_loss:.6f}")
+                if use_wandb and wandb_run:
+                    try:
+                        wandb_run.log({"train/loss_batch": avg_loss}, step=(epoch - 1) * total_steps_per_epoch + bidx)
+                    except Exception as e:
+                        logging.warning(f"Failed to log batch loss to wandb: {e}")
+
+        epoch_loss = running_loss_sum / N
         logging.info(f"Epoch {epoch:4d} loss {epoch_loss:.6f}")
 
         if use_wandb and wandb_run:
             try:
-                wandb.log({"train/loss": epoch_loss}, step=epoch)
+                wandb_run.log({"train/loss": epoch_loss}, step=epoch)
             except Exception as e:
-                logging.warning(f"Failed to log to wandb: {e}")
+                logging.warning(f"Failed to log epoch loss to wandb: {e}")
 
-        if epoch % args.save_ckpt_every == 0:
+        if epoch % args.save_ckpt_every == 0 or epoch == args.epochs:
+            try:
+                model_state = model.state_dict()
+            except Exception:
+                try:
+                    model_state = model._orig_mod.state_dict()
+                except Exception:
+                    model_state = None
+
             checkpoint = {
                 "epoch": epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": model_state if model_state is not None else model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "run_name": args.run_name,
                 "wandb_run_id": (wandb_run.id if wandb_run else None),
             }
-            ckpt_name = f"{args.run_name}_epoch_{epoch}.pt"
+            ckpt_name = os.path.join(args.ckpt_dir, f"{args.run_name}_epoch_{epoch}.pt")
             torch.save(checkpoint, ckpt_name)
             logging.info(f"Saved checkpoint: {ckpt_name}")
 
-        if epoch % args.save_img_every == 0:
+        if epoch % args.save_img_every == 0 or epoch == args.epochs:
             with torch.no_grad():
                 out = infer_in_chunks(model, coords, device, chunk_size=args.inference_chunk_size)
                 recon = (out.reshape(H, W, 3) * 255.0).astype(np.uint8)
                 pil_recon = Image.fromarray(recon)
-                img_name = f"{args.run_name}_epoch_{epoch}.png"
+                img_name = os.path.join(args.ckpt_dir, f"{args.run_name}_epoch_{epoch}.png")
                 pil_recon.save(img_name)
                 logging.info(f"Saved reconstruction: {img_name}")
                 if use_wandb and wandb_run:
                     try:
-                        import wandb
-                        wandb_run.log({"reconstruction": wandb.Image(pil_recon, caption=f"epoch {epoch}")}, step=epoch)
+                        import wandb as _wandb
+                        wandb_run.log({"reconstruction": _wandb.Image(pil_recon, caption=f"epoch {epoch}")}, step=epoch)
                     except Exception as e:
                         logging.warning(f"Failed to log reconstruction to wandb: {e}")
 
@@ -249,13 +334,13 @@ def main(args):
         out = infer_in_chunks(model, coords, device, chunk_size=args.inference_chunk_size)
         recon = (out.reshape(H, W, 3) * 255.0).astype(np.uint8)
         pil_recon = Image.fromarray(recon)
-        final_name = f"final_{args.run_name}_512.png"
+        final_name = os.path.join(args.ckpt_dir, f"final_{args.run_name}_512.png")
         pil_recon.save(final_name)
         logging.info(f"Saved {final_name}")
         if use_wandb and wandb_run:
             try:
-                import wandb
-                wandb_run.log({"reconstruction/final": wandb.Image(pil_recon, caption="final")})
+                import wandb as _wandb
+                wandb_run.log({"reconstruction/final": _wandb.Image(pil_recon, caption="final")})
                 wandb_run.finish()
             except Exception as e:
                 logging.warning(f"Failed to finalize wandb run: {e}")
@@ -264,3 +349,11 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+
+
+
+
+
+
+
+
